@@ -1,0 +1,286 @@
+// Tests for the multi-signature wallet implementation
+module MultiSigTest
+
+import MultiSig
+use aiken/transaction.{ScriptContext, Transaction, Input, Output}
+use aiken/transaction/credential.{Address, Credential, Script, PaymentCredential}
+use aiken/transaction/value
+use aiken/hash.{Blake2b_224, Hash}
+use aiken/list
+
+// Test constants
+const sig1: ByteArray = #"signature1"
+const sig2: ByteArray = #"signature2" 
+const sig3: ByteArray = #"signature3"
+const new_sig: ByteArray = #"signature4"
+
+const target_script: MultiSig.ScriptHash = #"deadbeef00000000000000000000000000000000000000000000000000000000"
+const this_script: MultiSig.ScriptHash = #"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+
+// Test standard withdrawal with sufficient signatures
+test standard_withdraw_with_enough_sigs() {
+  let datum = MultiSig.new_datum([sig1, sig2, sig3], 2, None)
+  
+  let action = MultiSig.MultiSigAction.Spend { purpose: MultiSig.SpendPurpose.StandardWithdraw }
+  
+  let transaction = Transaction {
+    inputs: [],
+    reference_inputs: [],
+    outputs: [],
+    fee: value.zero(),
+    mint: value.zero(), 
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 0),
+    extra_signatories: [sig1, sig2], // Two signatures
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction,
+  }
+  
+  // Should pass with 2 of 3 signatures
+  MultiSig.multi_sig(datum, action, ctx)
+}
+
+// Test standard withdrawal with insufficient signatures
+test standard_withdraw_with_insufficient_sigs() {
+  let datum = MultiSig.new_datum([sig1, sig2, sig3], 2, None)
+  
+  let action = MultiSig.MultiSigAction.Spend { purpose: MultiSig.SpendPurpose.StandardWithdraw }
+  
+  let transaction = Transaction {
+    inputs: [],
+    reference_inputs: [],
+    outputs: [],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 0),
+    extra_signatories: [sig1], // Only one signature
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction,
+  }
+  
+  // Should fail with only 1 signature when 2 are required
+  !MultiSig.multi_sig(datum, action, ctx)
+}
+
+// Test time-locked withdrawal before the lock expires
+test time_locked_withdraw_before_expiry() {
+  let lock_time = 1000
+  let datum = MultiSig.new_datum([sig1, sig2, sig3], 2, Some(lock_time))
+  
+  let action = MultiSig.MultiSigAction.Spend { purpose: MultiSig.SpendPurpose.StandardWithdraw }
+  
+  let transaction = Transaction {
+    inputs: [],
+    reference_inputs: [],
+    outputs: [],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 999), // Before lock time
+    extra_signatories: [sig1, sig2],
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction,
+  }
+  
+  // Should fail because lock time hasn't passed yet
+  !MultiSig.multi_sig(datum, action, ctx)
+}
+
+// Test time-locked withdrawal after the lock expires
+test time_locked_withdraw_after_expiry() {
+  let lock_time = 1000
+  let datum = MultiSig.new_datum([sig1, sig2, sig3], 2, Some(lock_time))
+  
+  let action = MultiSig.MultiSigAction.Spend { purpose: MultiSig.SpendPurpose.StandardWithdraw }
+  
+  let transaction = Transaction {
+    inputs: [],
+    reference_inputs: [],
+    outputs: [],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 1001), // After lock time
+    extra_signatories: [sig1, sig2],
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction,
+  }
+  
+  // Should pass because lock time has passed
+  MultiSig.multi_sig(datum, action, ctx)
+}
+
+// Test emergency withdrawal
+test emergency_withdraw() {
+  let datum = MultiSig.new_datum([sig1, sig2, sig3], 2, Some(2000))
+  
+  let action = MultiSig.MultiSigAction.Spend { purpose: MultiSig.SpendPurpose.EmergencyWithdraw }
+  
+  // Test with all signatures
+  let all_sigs_tx = Transaction {
+    inputs: [],
+    reference_inputs: [],
+    outputs: [],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 1000), // Even before lock time
+    extra_signatories: [sig1, sig2, sig3], // All signatures
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  // Test with partial signatures
+  let partial_sigs_tx = Transaction {
+    inputs: [],
+    reference_inputs: [],
+    outputs: [],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 1000),
+    extra_signatories: [sig1, sig2], // Only 2 signatures
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx_all = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction: all_sigs_tx,
+  }
+  
+  let ctx_partial = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction: partial_sigs_tx,
+  }
+  
+  and {
+    // Should pass with all signatures
+    MultiSig.multi_sig(datum, action, ctx_all),
+    // Should fail with only some signatures
+    !MultiSig.multi_sig(datum, action, ctx_partial),
+  }
+}
+
+// Test protocol upgrade
+test protocol_upgrade() {
+  let datum = MultiSig.new_datum([sig1, sig2, sig3], 2, None)
+  
+  let action = MultiSig.MultiSigAction.Spend { 
+    purpose: MultiSig.SpendPurpose.ProtocolUpgrade { target_script: target_script } 
+  }
+  
+  // Create output going to the target script
+  let upgrade_output = Output {
+    address: Address {
+      payment_credential: Credential.Script(target_script),
+      stake_credential: None,
+    },
+    value: value.zero(),
+    datum: None,
+    reference_script: None,
+  }
+  
+  let transaction = Transaction {
+    inputs: [],
+    reference_inputs: [],
+    outputs: [upgrade_output],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 0),
+    extra_signatories: [sig1, sig2],
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction,
+  }
+  
+  // Should pass when sending funds to target script
+  MultiSig.multi_sig(datum, action, ctx)
+}
+
+// Test adding a new signatory
+test add_signatory() {
+  let datum = MultiSig.new_datum([sig1, sig2], 2, None)
+  
+  let action = MultiSig.MultiSigAction.AddSignatory { new_signatory: new_sig }
+  
+  // Create expected new datum
+  let new_datum = MultiSig.new_datum([sig1, sig2, new_sig], 2, None)
+  
+  // Create output going back to this script with updated datum
+  let update_output = Output {
+    address: Address {
+      payment_credential: Credential.Script(this_script),
+      stake_credential: None,
+    },
+    value: value.zero(),
+    datum: Some(new_datum),
+    reference_script: None,
+  }
+  
+  let transaction = Transaction {
+    inputs: [],
+    reference_inputs: [],
+    outputs: [update_output],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 0),
+    extra_signatories: [sig1, sig2],
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction,
+  }
+  
+  // Mock the ctx.get_spending_validator_hash() function
+  when ctx.get_spending_validator_hash() is {
+    Some(_) -> MultiSig.multi_sig(datum, action, ctx),
+    None -> False,
+  }
+}

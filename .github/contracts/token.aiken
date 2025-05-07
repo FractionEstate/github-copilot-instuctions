@@ -1,0 +1,100 @@
+// A simple fungible token implementation in Aiken
+// Demonstrates best practices for token handling on Cardano
+module Token
+
+type TokenId {
+  policy_id: ByteArray,
+  asset_name: ByteArray,
+}
+
+type Token {
+  id: TokenId,
+  owner: ByteArray,  // Owner's address as ByteArray
+  balance: Int,
+  frozen: Bool,      // Whether token transfers are frozen
+  metadata: Data,    // Arbitrary metadata associated with the token
+}
+
+// Create a new token with initial settings
+pub fn create(
+  policy_id: ByteArray,
+  asset_name: ByteArray,
+  owner: ByteArray,
+  initial_balance: Int,
+  metadata: Data,
+) -> Result<Token, String> {
+  // Validate inputs
+  when initial_balance {
+    balance if balance < 0 -> Err("Initial balance cannot be negative")
+    _ -> {
+      // Create token with valid parameters
+      let token_id = TokenId { policy_id, asset_name }
+      Ok(
+        Token {
+          id: token_id,
+          owner,
+          balance: initial_balance,
+          frozen: False,
+          metadata,
+        },
+      )
+    }
+  }
+}
+
+// Transfer tokens to another address
+pub fn transfer(
+  token: Token,
+  to: ByteArray,
+  amount: Int,
+) -> Result<Token, String> {
+  // Check for frozen status
+  if token.frozen {
+    Err("Token transfers are currently frozen")
+  } else {
+    // Check for sufficient balance
+    if token.balance < amount {
+      Err("Insufficient balance")
+    } else if amount <= 0 {
+      Err("Transfer amount must be positive")
+    } else {
+      // Create updated token with new owner and balance
+      Ok(
+        Token {
+          id: token.id,
+          owner: to,
+          balance: token.balance - amount,
+          frozen: token.frozen,
+          metadata: token.metadata,
+        },
+      )
+    }
+  }
+}
+
+// Freeze or unfreeze token transfers
+pub fn set_frozen(token: Token, is_frozen: Bool) -> Token {
+  Token {
+    id: token.id,
+    owner: token.owner, 
+    balance: token.balance,
+    frozen: is_frozen,
+    metadata: token.metadata,
+  }
+}
+
+// Update token metadata
+pub fn update_metadata(token: Token, new_metadata: Data) -> Token {
+  Token {
+    id: token.id,
+    owner: token.owner,
+    balance: token.balance,
+    frozen: token.frozen,
+    metadata: new_metadata,
+  }
+}
+
+// Check if two tokens have the same ID
+pub fn same_token(a: TokenId, b: TokenId) -> Bool {
+  a.policy_id == b.policy_id && a.asset_name == b.asset_name
+}

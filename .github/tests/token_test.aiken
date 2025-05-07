@@ -1,0 +1,110 @@
+// Tests for the token contract implementation
+module TokenTest
+
+import Token
+
+// Define constants for testing
+const policy_id_1: ByteArray = #"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+const policy_id_2: ByteArray = #"fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321"
+const asset_name_1: ByteArray = #"546f6b656e41" // "TokenA" in hex
+const owner_1: ByteArray = #"owner1"
+const owner_2: ByteArray = #"owner2"
+
+// Test token creation with valid parameters
+test create_token_success() {
+  let result = Token.create(policy_id_1, asset_name_1, owner_1, 100, Void)
+  
+  expect Ok(token) = result
+  
+  and {
+    token.id.policy_id == policy_id_1,
+    token.id.asset_name == asset_name_1,
+    token.owner == owner_1,
+    token.balance == 100,
+    token.frozen == False,
+  }
+}
+
+// Test token creation with negative balance (should fail)
+test create_token_negative_balance() {
+  let result = Token.create(policy_id_1, asset_name_1, owner_1, -10, Void)
+  
+  expect Err(msg) = result
+  
+  msg == "Initial balance cannot be negative"
+}
+
+// Test token transfer with sufficient balance
+test transfer_token_success() {
+  let create_result = Token.create(policy_id_1, asset_name_1, owner_1, 100, Void)
+  expect Ok(token) = create_result
+  
+  let transfer_result = Token.transfer(token, owner_2, 30)
+  expect Ok(updated_token) = transfer_result
+  
+  and {
+    updated_token.owner == owner_2,
+    updated_token.balance == 70,
+  }
+}
+
+// Test token transfer with insufficient balance
+test transfer_token_insufficient_balance() {
+  let create_result = Token.create(policy_id_1, asset_name_1, owner_1, 20, Void)
+  expect Ok(token) = create_result
+  
+  let transfer_result = Token.transfer(token, owner_2, 30)
+  expect Err(msg) = transfer_result
+  
+  msg == "Insufficient balance"
+}
+
+// Test token transfer with zero amount
+test transfer_token_zero_amount() {
+  let create_result = Token.create(policy_id_1, asset_name_1, owner_1, 100, Void)
+  expect Ok(token) = create_result
+  
+  let transfer_result = Token.transfer(token, owner_2, 0)
+  expect Err(msg) = transfer_result
+  
+  msg == "Transfer amount must be positive"
+}
+
+// Test token freeze functionality
+test freeze_token() {
+  let create_result = Token.create(policy_id_1, asset_name_1, owner_1, 100, Void)
+  expect Ok(token) = create_result
+  
+  // Freeze the token
+  let frozen_token = Token.set_frozen(token, True)
+  
+  // Attempt transfer on frozen token
+  let transfer_result = Token.transfer(frozen_token, owner_2, 50)
+  expect Err(msg) = transfer_result
+  
+  msg == "Token transfers are currently frozen"
+}
+
+// Test token metadata update
+test update_metadata() {
+  let create_result = Token.create(policy_id_1, asset_name_1, owner_1, 100, Void)
+  expect Ok(token) = create_result
+  
+  // Update metadata
+  let new_metadata = "Updated metadata"
+  let updated_token = Token.update_metadata(token, new_metadata)
+  
+  updated_token.metadata == new_metadata
+}
+
+// Test token ID comparison
+test same_token_id() {
+  let id1 = Token.TokenId { policy_id: policy_id_1, asset_name: asset_name_1 }
+  let id2 = Token.TokenId { policy_id: policy_id_1, asset_name: asset_name_1 }
+  let id3 = Token.TokenId { policy_id: policy_id_2, asset_name: asset_name_1 }
+  
+  and {
+    Token.same_token(id1, id2) == True,
+    Token.same_token(id1, id3) == False,
+  }
+}

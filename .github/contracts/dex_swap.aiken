@@ -1,0 +1,349 @@
+// Simple DEX Swap Contract
+// Demonstrates Plutus V3 features for trading assets on Cardano
+module DexSwap
+
+use aiken/transaction.{ScriptContext, InlineDatum, Output, Input, Spend}
+use aiken/transaction/credential.{Address, Script, Credential}
+use aiken/transaction/value.{Value, AssetName, PolicyId, from_asset, add, quantities_by_policy}
+use aiken/list
+use aiken/interval.{Interval}
+use aiken/hash.{Blake2b_224, Hash}
+
+// Type alias for script hash
+type ScriptHash = Hash<Blake2b_224, Script>
+
+// Pool data containing liquidity information
+type PoolDatum {
+  // Token A policy ID and asset name
+  token_a_policy: PolicyId,
+  token_a_name: AssetName,
+  // Token B policy ID and asset name
+  token_b_policy: PolicyId,
+  token_b_name: AssetName,
+  // Current reserves of token A and B
+  reserve_a: Int,
+  reserve_b: Int,
+  // Fee parameters (in basis points, e.g., 30 = 0.3%)
+  fee_bps: Int,
+  // Owner who can update pool settings
+  owner: ByteArray,
+  // Optional reference to price oracle
+  price_oracle: Option<ScriptHash>,
+}
+
+// Different actions that can be performed with the pool
+type PoolAction {
+  // Add liquidity to the pool
+  AddLiquidity
+  // Remove liquidity from the pool  
+  RemoveLiquidity
+  // Swap tokens in the pool
+  Swap { exact_output: Bool }
+  // Update pool settings (owner only)
+  UpdateSettings { 
+    new_fee_bps: Int,
+    new_oracle: Option<ScriptHash>,
+  }
+}
+
+// The main pool validator
+validator {
+  fn swap_pool(datum: PoolDatum, redeemer: PoolAction, ctx: ScriptContext) -> Bool {
+    let ScriptContext { transaction, purpose } = ctx
+    
+    when purpose is {
+      Spend(output_reference) -> {
+        // Find our input in the transaction
+        let own_input = transaction.inputs 
+          |> list.find(fn(input) { input.output_reference == output_reference })?
+        
+        // Handle different pool actions
+        when redeemer is {
+          Swap { exact_output } -> handle_swap(datum, own_input, transaction, exact_output),
+          
+          AddLiquidity -> handle_add_liquidity(datum, own_input, transaction),
+          
+          RemoveLiquidity -> handle_remove_liquidity(datum, own_input, transaction),
+          
+          UpdateSettings { new_fee_bps, new_oracle } -> {
+            // Only owner can update settings
+            if !transaction.is_signed_by(datum.owner) {
+              False
+            } else if new_fee_bps < 0 || new_fee_bps > 1000 {
+              // Fee must be between 0% and 10%
+              False
+            } else {
+              // Find the output going back to this script
+              let this_script = ctx.get_spending_validator_hash()?
+              verify_pool_continuation(datum, this_script, transaction, fn(new_datum) {
+                // Verify that only allowed settings were updated
+                datum.token_a_policy == new_datum.token_a_policy &&
+                datum.token_a_name == new_datum.token_a_name &&
+                datum.token_b_policy == new_datum.token_b_policy &&
+                datum.token_b_name == new_datum.token_b_name &&
+                datum.reserve_a == new_datum.reserve_a &&
+                datum.reserve_b == new_datum.reserve_b &&
+                new_datum.fee_bps == new_fee_bps &&
+                new_datum.owner == datum.owner &&
+                new_datum.price_oracle == new_oracle
+              })
+            }
+          }
+        }
+      }
+      _ -> False // Only spending purpose is allowed
+    }
+  }
+}
+
+// Handle swap operation
+fn handle_swap(
+  datum: PoolDatum, 
+  own_input: Input, 
+  transaction: transaction.Transaction,
+  exact_output: Bool
+) -> Bool {
+  // Calculate pool constants
+  let input_value = own_input.output.value
+  let reserve_a = datum.reserve_a
+  let reserve_b = datum.reserve_b
+  
+  // Extract tokens from values
+  let token_a = from_asset(datum.token_a_policy, datum.token_a_name)
+  let token_b = from_asset(datum.token_b_policy, datum.token_b_name)
+  
+  // Find pool output UTxO
+  let this_script = own_input.output.address.payment_credential
+  when this_script is {
+    Credential.Script(script_hash) -> {
+      let pool_outputs =
+        transaction.outputs
+        |> list.filter(fn(output) {
+          output.address.payment_credential == Credential.Script(script_hash)
+        })
+      
+      when list.head(pool_outputs) is {
+        Some(pool_output) -> {
+          // Extract new pool datum
+          when pool_output.datum is {
+            InlineDatum(datum_data) -> {
+              let new_datum: PoolDatum = datum_data
+              
+              // Verify token identifiers match
+              let tokens_match =
+                new_datum.token_a_policy == datum.token_a_policy &&
+                new_datum.token_a_name == datum.token_a_name &&
+                new_datum.token_b_policy == datum.token_b_policy &&
+                new_datum.token_b_name == datum.token_b_name &&
+                new_datum.fee_bps == datum.fee_bps &&
+                new_datum.owner == datum.owner &&
+                new_datum.price_oracle == datum.price_oracle
+              
+              if !tokens_match {
+                False
+              } else {
+                // Extract token amounts from pool output
+                let output_value = pool_output.value
+                let new_reserve_a = value.quantity_of(output_value, datum.token_a_policy, datum.token_a_name)
+                let new_reserve_b = value.quantity_of(output_value, datum.token_b_policy, datum.token_b_name)
+                
+                // Calculate amounts swapped
+                let delta_a = new_reserve_a - reserve_a
+                let delta_b = new_reserve_b - reserve_b
+                
+                // One token should increase, one should decrease
+                if delta_a <= 0 && delta_b <= 0 || delta_a >= 0 && delta_b >= 0 {
+                  False
+                } else {
+                  // Determine input and output amounts
+                  let (token_in, token_out, amount_in, amount_out) =
+                    if delta_a > 0 {
+                      (token_a, token_b, delta_a, -delta_b)
+                    } else {
+                      (token_b, token_a, delta_b, -delta_a)
+                    }
+                  
+                  if amount_in <= 0 || amount_out <= 0 {
+                    False
+                  } else {
+                    // Calculate price impact and apply fee
+                    let fee_amount = amount_in * datum.fee_bps / 10000
+                    let adjusted_in = amount_in - fee_amount
+                    
+                    // Check if swap satisfies the constant product formula
+                    // (reserve_a + delta_a) * (reserve_b + delta_b) >= reserve_a * reserve_b
+                    let new_product = new_reserve_a * new_reserve_b
+                    let old_product = reserve_a * reserve_b
+                    
+                    // The product can only increase (or stay the same) due to fees
+                    new_product >= old_product
+                  }
+                }
+              }
+            }
+            _ -> False,
+          }
+        }
+        None -> False,
+      }
+    }
+    _ -> False,
+  }
+}
+
+// Handle adding liquidity to the pool
+fn handle_add_liquidity(datum: PoolDatum, own_input: Input, transaction: transaction.Transaction) -> Bool {
+  // Find this script's hash
+  let this_script = own_input.output.address.payment_credential
+  
+  when this_script is {
+    Credential.Script(script_hash) -> {
+      // Find any UTxO going back to this script
+      verify_pool_continuation(datum, script_hash, transaction, fn(new_datum) {
+        // Verify tokenA and tokenB remain the same
+        if new_datum.token_a_policy != datum.token_a_policy ||
+           new_datum.token_a_name != datum.token_a_name ||
+           new_datum.token_b_policy != datum.token_b_policy ||
+           new_datum.token_b_name != datum.token_b_name {
+          False
+        } else {
+          let delta_a = new_datum.reserve_a - datum.reserve_a
+          let delta_b = new_datum.reserve_b - datum.reserve_b
+          
+          // Adding liquidity means both reserves increase
+          if delta_a <= 0 || delta_b <= 0 {
+            False
+          } else {
+            // For initial deposit any ratio is allowed
+            if datum.reserve_a == 0 && datum.reserve_b == 0 {
+              True
+            } else {
+              // Verify the deposit maintains the price ratio
+              // delta_b / delta_a ~= reserve_b / reserve_a
+              // Cross multiplication to avoid division: delta_b * reserve_a ~= delta_a * reserve_b
+              // Allow for rounding error of 1
+              let cross1 = delta_b * datum.reserve_a
+              let cross2 = delta_a * datum.reserve_b
+              let diff = cross1 - cross2
+              diff >= -1 && diff <= 1
+            }
+          }
+        }
+      })
+    }
+    _ -> False,
+  }
+}
+
+// Handle removing liquidity from the pool
+fn handle_remove_liquidity(datum: PoolDatum, own_input: Input, transaction: transaction.Transaction) -> Bool {
+  // Find this script's hash
+  let this_script = own_input.output.address.payment_credential
+  
+  when this_script is {
+    Credential.Script(script_hash) -> {
+      // Find any UTxO going back to this script
+      verify_pool_continuation(datum, script_hash, transaction, fn(new_datum) {
+        // Verify tokenA and tokenB remain the same
+        if new_datum.token_a_policy != datum.token_a_policy ||
+           new_datum.token_a_name != datum.token_a_name ||
+           new_datum.token_b_policy != datum.token_b_policy ||
+           new_datum.token_b_name != datum.token_b_name {
+          False
+        } else {
+          let delta_a = new_datum.reserve_a - datum.reserve_a
+          let delta_b = new_datum.reserve_b - datum.reserve_b
+          
+          // Removing liquidity means both reserves decrease
+          if delta_a >= 0 || delta_b >= 0 {
+            False
+          } else {
+            // Verify the withdrawal maintains the price ratio
+            // delta_b / delta_a ~= reserve_b / reserve_a
+            // Cross multiplication to avoid division: delta_b * reserve_a ~= delta_a * reserve_b
+            // Allow for rounding error of 1
+            let cross1 = delta_b * datum.reserve_a
+            let cross2 = delta_a * datum.reserve_b
+            let diff = cross1 - cross2
+            diff >= -1 && diff <= 1
+          }
+        }
+      })
+    }
+    _ -> False,
+  }
+}
+
+// Helper function to verify pool continuation with updated datum
+fn verify_pool_continuation(
+  datum: PoolDatum,
+  script_hash: ScriptHash,
+  transaction: transaction.Transaction,
+  verify_fn: fn(PoolDatum) -> Bool,
+) -> Bool {
+  // Find pool output UTxO
+  let pool_outputs =
+    transaction.outputs
+    |> list.filter(fn(output) {
+      output.address.payment_credential == Credential.Script(script_hash)
+    })
+  
+  // At least one output must go back to the pool
+  if list.length(pool_outputs) == 0 {
+    False
+  } else {
+    // Find an output with a valid datum update
+    list.any(
+      pool_outputs,
+      fn(pool_output) {
+        when pool_output.datum is {
+          InlineDatum(datum_data) -> {
+            let new_datum: PoolDatum = datum_data
+            // Apply the custom verification function
+            verify_fn(new_datum)
+          }
+          _ -> False,
+        }
+      },
+    )
+  }
+}
+
+// Utility function to check if there's a valid oracle reference input
+pub fn check_oracle_reference(
+  oracle_hash: ScriptHash,
+  transaction: transaction.Transaction,
+) -> Bool {
+  transaction.reference_inputs
+  |> list.any(fn(input) {
+    when input.output.reference_script is {
+      Some(script) -> script.hash() == oracle_hash,
+      None -> False,
+    }
+  })
+}
+
+// Create a new pool datum
+pub fn new_pool(
+  token_a_policy: PolicyId,
+  token_a_name: AssetName,
+  token_b_policy: PolicyId, 
+  token_b_name: AssetName,
+  reserve_a: Int,
+  reserve_b: Int,
+  fee_bps: Int,
+  owner: ByteArray,
+  price_oracle: Option<ScriptHash>,
+) -> PoolDatum {
+  PoolDatum {
+    token_a_policy,
+    token_a_name,
+    token_b_policy,
+    token_b_name,
+    reserve_a,
+    reserve_b,
+    fee_bps,
+    owner,
+    price_oracle,
+  }
+}

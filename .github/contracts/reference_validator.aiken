@@ -1,0 +1,82 @@
+// Reference Validator Example
+// Demonstrates Plutus V3 features: reference scripts and reference inputs
+module ReferenceValidator
+
+use aiken/transaction.{ScriptContext, InlineDatum, find_input, Output, Input}
+use aiken/transaction/credential.{Script, Credential}
+use aiken/transaction/value
+use aiken/hash.{Blake2b_224, Hash}
+use aiken/list
+
+// Type alias for script hash
+type ScriptHash = Hash<Blake2b_224, Script>
+
+// Represents what the validator is protecting
+type Datum {
+  // The owner of this validator's assets
+  owner: ByteArray,
+  // List of authorized reference validator hashes
+  allowed_validators: List<ScriptHash>,
+}
+
+// Commands that can be executed by this validator
+type Action {
+  // Withdraw funds from the validator
+  Withdraw { amount: Int }
+  // Delegate to another reference validator
+  Delegate { target_validator_index: Int }
+}
+
+// Primary validator function
+validator {
+  fn spend(datum: Datum, action: Action, ctx: ScriptContext) -> Bool {
+    let ScriptContext { transaction, purpose } = ctx
+    
+    when action is {
+      // Handle withdrawal action
+      Withdraw { amount } -> {
+        // Basic security check: owner must sign the transaction
+        transaction.is_signed_by(datum.owner)
+      }
+      
+      // Handle delegation to another validator
+      Delegate { target_validator_index } -> {
+        // Find the specified validator in the allowed list
+        when list.at(datum.allowed_validators, target_validator_index) is {
+          Some(target_hash) -> {
+            // Use Plutus V3 feature: Find reference input with target validator
+            let reference_input_result = 
+              transaction.reference_inputs
+              |> list.find(fn(input) {
+                when input.output.reference_script is {
+                  Some(script) -> script.hash() == target_hash,
+                  None -> False,
+                }
+              })
+            
+            // If we found the reference validator, proceed with owner check
+            when reference_input_result is {
+              Some(_) -> {
+                // Owner must still authorize the delegation
+                transaction.is_signed_by(datum.owner)
+              }
+              None -> False,
+            }
+          }
+          None -> False,
+        }
+      }
+    }
+  }
+}
+
+// Helper function to check if an output returns to this validator
+pub fn is_own_validator(
+  validator_hash: ScriptHash,
+  output: Output,
+) -> Bool {
+  when output.address.payment_credential is {
+    Credential.Script(script_hash) -> script_hash == validator_hash,
+    _ -> False,
+  }
+}

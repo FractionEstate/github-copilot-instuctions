@@ -1,0 +1,149 @@
+// Tests for Reference Validator
+module ReferenceValidatorTest
+
+import ReferenceValidator
+use aiken/transaction.{ScriptContext, Transaction, Input, Output, Reference}
+use aiken/transaction/credential.{Script, Credential}
+use aiken/transaction/value
+use aiken/hash.{Blake2b_224, Hash}
+use aiken/list
+
+// Test constants
+const owner_1: ByteArray = #"owner1"
+const validator_hash_1: ByteArray = #"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+const validator_hash_2: ByteArray = #"fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321"
+
+// Test withdrawal with valid signature
+test withdraw_with_valid_signature() {
+  let datum = ReferenceValidator.Datum {
+    owner: owner_1,
+    allowed_validators: [validator_hash_1, validator_hash_2],
+  }
+
+  let action = ReferenceValidator.Action.Withdraw { amount: 100 }
+  
+  let transaction = Transaction {
+    inputs: [],
+    reference_inputs: [],
+    outputs: [],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 0),
+    extra_signatories: [owner_1],
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction,
+  }
+  
+  // Verify that owner can withdraw
+  ReferenceValidator.spend(datum, action, ctx)
+}
+
+// Test withdrawal without signature (should fail)
+test withdraw_without_signature() {
+  let datum = ReferenceValidator.Datum {
+    owner: owner_1,
+    allowed_validators: [validator_hash_1, validator_hash_2],
+  }
+
+  let action = ReferenceValidator.Action.Withdraw { amount: 100 }
+  
+  let transaction = Transaction {
+    inputs: [],
+    reference_inputs: [],
+    outputs: [],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 0),
+    extra_signatories: [], // No signatures
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction,
+  }
+  
+  // Verify that withdrawal fails without owner signature
+  !ReferenceValidator.spend(datum, action, ctx)
+}
+
+// Test delegation with valid reference input
+test delegate_with_valid_reference() {
+  let datum = ReferenceValidator.Datum {
+    owner: owner_1,
+    allowed_validators: [validator_hash_1, validator_hash_2],
+  }
+
+  let action = ReferenceValidator.Action.Delegate { target_validator_index: 0 }
+  
+  // Create a reference input with the target validator script
+  let mock_script = Script { bytes: validator_hash_1 }
+  
+  let reference_output = Output {
+    address: aiken/transaction/credential.Address {
+      payment_credential: Credential.Script(validator_hash_2),
+      stake_credential: None,
+    },
+    value: value.zero(),
+    datum: None,
+    reference_script: Some(mock_script),
+  }
+  
+  let reference_input = Input {
+    output_reference: #"",
+    output: reference_output,
+  }
+  
+  let transaction = Transaction {
+    inputs: [],
+    reference_inputs: [reference_input], // Include reference input
+    outputs: [],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 0),
+    extra_signatories: [owner_1],
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction,
+  }
+  
+  // Verify that delegation works with valid reference input and signature
+  ReferenceValidator.spend(datum, action, ctx)
+}
+
+// Test the helper function for checking outputs
+test is_own_validator_function() {
+  let output = Output {
+    address: aiken/transaction/credential.Address {
+      payment_credential: Credential.Script(validator_hash_1),
+      stake_credential: None,
+    },
+    value: value.zero(),
+    datum: None,
+    reference_script: None,
+  }
+  
+  and {
+    ReferenceValidator.is_own_validator(validator_hash_1, output) == True,
+    ReferenceValidator.is_own_validator(validator_hash_2, output) == False,
+  }
+}

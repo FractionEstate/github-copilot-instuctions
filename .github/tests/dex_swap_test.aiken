@@ -1,0 +1,376 @@
+// Tests for DEX Swap Contract
+// Demonstrates testing Plutus V3 features like inline datums and reference scripts
+module DexSwapTest
+
+import DexSwap
+use aiken/transaction.{ScriptContext, Transaction, Input, Output, InlineDatum}
+use aiken/transaction/credential.{Address, Script, Credential}
+use aiken/transaction/value
+use aiken/hash.{Blake2b_224, Hash}
+use aiken/list
+
+// Test constants
+const owner: ByteArray = #"owner"
+
+const policy_id_a: ByteArray = #"1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+const asset_name_a: ByteArray = #"546f6b656e41" // TokenA in hex
+
+const policy_id_b: ByteArray = #"fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321"
+const asset_name_b: ByteArray = #"546f6b656e42" // TokenB in hex
+
+const oracle_hash: ByteArray = #"deadbeef00000000000000000000000000000000000000000000000000000000"
+const script_hash: ByteArray = #"1111111111111111111111111111111111111111111111111111111111111111"
+
+// Test basic pool creation
+test new_pool_initialization() {
+  // Create a new pool with initial settings
+  let pool_datum = DexSwap.new_pool(
+    policy_id_a,
+    asset_name_a,
+    policy_id_b,
+    asset_name_b,
+    1000,
+    2000,
+    30, // 0.3% fee
+    owner,
+    None,
+  )
+  
+  // Verify pool has correct initial values
+  and {
+    pool_datum.token_a_policy == policy_id_a,
+    pool_datum.token_a_name == asset_name_a,
+    pool_datum.token_b_policy == policy_id_b,
+    pool_datum.token_b_name == asset_name_b,
+    pool_datum.reserve_a == 1000,
+    pool_datum.reserve_b == 2000,
+    pool_datum.fee_bps == 30,
+    pool_datum.owner == owner,
+    pool_datum.price_oracle == None,
+  }
+}
+
+// Test swap operation with fee collection
+test swap_tokens() {
+  // Initial pool state
+  let pool_datum = DexSwap.new_pool(
+    policy_id_a,
+    asset_name_a,
+    policy_id_b,
+    asset_name_b,
+    10000,  // Token A reserve
+    20000,  // Token B reserve
+    30,     // 0.3% fee
+    owner,
+    None,
+  )
+  
+  // After swap, token A increases by 1000, token B decreases accordingly
+  let new_reserve_a = 11000  // +1000 token A
+  
+  // Calculate expected token B outflow based on constant product formula
+  // Original product = 10000 * 20000 = 200,000,000
+  // Fee = 1000 * 0.003 = 3 tokens
+  // Adjusted amount in = 997 tokens
+  // New reserve A = 10000 + 1000 = 11000
+  // New reserve B = 200,000,000 / 11000 = 18,181.82...
+  // Must be rounded down for safety
+  let new_reserve_b = 18181
+  let token_b_out = 20000 - new_reserve_b  // 1819 tokens out
+  
+  // Create a new datum with updated reserves
+  let new_pool_datum = DexSwap.new_pool(
+    policy_id_a,
+    asset_name_a,
+    policy_id_b,
+    asset_name_b,
+    new_reserve_a,
+    new_reserve_b,
+    30,
+    owner,
+    None,
+  )
+  
+  // Create pool input with original reserves
+  let token_a_value = value.from_asset(policy_id_a, asset_name_a, 10000)
+  let token_b_value = value.from_asset(policy_id_b, asset_name_b, 20000)
+  let pool_value = value.add(token_a_value, token_b_value)
+  
+  let pool_output = Output {
+    address: Address { 
+      payment_credential: Credential.Script(script_hash),
+      stake_credential: None,
+    },
+    value: pool_value,
+    datum: InlineDatum(pool_datum),
+    reference_script: None,
+  }
+  
+  let own_input = Input {
+    output_reference: #"",
+    output: pool_output,
+  }
+  
+  // Create pool output with updated reserves
+  let new_token_a_value = value.from_asset(policy_id_a, asset_name_a, new_reserve_a)
+  let new_token_b_value = value.from_asset(policy_id_b, asset_name_b, new_reserve_b)
+  let new_pool_value = value.add(new_token_a_value, new_token_b_value)
+  
+  let new_pool_output = Output {
+    address: Address { 
+      payment_credential: Credential.Script(script_hash),
+      stake_credential: None,
+    },
+    value: new_pool_value,
+    datum: InlineDatum(new_pool_datum),
+    reference_script: None,
+  }
+  
+  // Create transaction with swap details
+  let transaction = Transaction {
+    inputs: [own_input],
+    reference_inputs: [],
+    outputs: [new_pool_output],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 0),
+    extra_signatories: [],
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction,
+  }
+  
+  // Test the swap action
+  DexSwap.handle_swap(pool_datum, own_input, transaction, False)
+}
+
+// Test adding liquidity
+test add_liquidity() {
+  // Initial pool with reserves
+  let pool_datum = DexSwap.new_pool(
+    policy_id_a,
+    asset_name_a,
+    policy_id_b,
+    asset_name_b,
+    10000,  // Token A reserve
+    20000,  // Token B reserve
+    30,     // Fee
+    owner,
+    None,
+  )
+  
+  // Add liquidity in the same ratio: 1:2
+  let new_reserve_a = 11000  // +1000 token A
+  let new_reserve_b = 22000  // +2000 token B
+  
+  // Create a new datum with updated reserves
+  let new_pool_datum = DexSwap.new_pool(
+    policy_id_a,
+    asset_name_a,
+    policy_id_b,
+    asset_name_b,
+    new_reserve_a,
+    new_reserve_b,
+    30,
+    owner,
+    None,
+  )
+  
+  // Create pool input with original reserves
+  let token_a_value = value.from_asset(policy_id_a, asset_name_a, 10000)
+  let token_b_value = value.from_asset(policy_id_b, asset_name_b, 20000)
+  let pool_value = value.add(token_a_value, token_b_value)
+  
+  let pool_output = Output {
+    address: Address { 
+      payment_credential: Credential.Script(script_hash),
+      stake_credential: None,
+    },
+    value: pool_value,
+    datum: InlineDatum(pool_datum),
+    reference_script: None,
+  }
+  
+  let own_input = Input {
+    output_reference: #"",
+    output: pool_output,
+  }
+  
+  // Create pool output with updated reserves
+  let new_token_a_value = value.from_asset(policy_id_a, asset_name_a, new_reserve_a)
+  let new_token_b_value = value.from_asset(policy_id_b, asset_name_b, new_reserve_b)
+  let new_pool_value = value.add(new_token_a_value, new_token_b_value)
+  
+  let new_pool_output = Output {
+    address: Address { 
+      payment_credential: Credential.Script(script_hash),
+      stake_credential: None,
+    },
+    value: new_pool_value,
+    datum: InlineDatum(new_pool_datum),
+    reference_script: None,
+  }
+  
+  // Create transaction with add liquidity details
+  let transaction = Transaction {
+    inputs: [own_input],
+    reference_inputs: [],
+    outputs: [new_pool_output],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 0),
+    extra_signatories: [],
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  // Test the add liquidity action
+  DexSwap.handle_add_liquidity(pool_datum, own_input, transaction)
+}
+
+// Test updating pool settings
+test update_settings() {
+  // Initial pool state
+  let pool_datum = DexSwap.new_pool(
+    policy_id_a,
+    asset_name_a,
+    policy_id_b,
+    asset_name_b,
+    10000,  // Token A reserve
+    20000,  // Token B reserve
+    30,     // Old fee 0.3%
+    owner,
+    None,
+  )
+  
+  // Create updated pool datum with new fee and oracle
+  let new_fee_bps = 50  // Change to 0.5% fee
+  let new_oracle = Some(oracle_hash)
+  
+  let new_pool_datum = DexSwap.new_pool(
+    policy_id_a,
+    asset_name_a,
+    policy_id_b,
+    asset_name_b,
+    10000,  // Same reserves
+    20000,
+    new_fee_bps,
+    owner,  // Same owner
+    new_oracle,
+  )
+  
+  // Create pool input with original settings
+  let token_a_value = value.from_asset(policy_id_a, asset_name_a, 10000)
+  let token_b_value = value.from_asset(policy_id_b, asset_name_b, 20000)
+  let pool_value = value.add(token_a_value, token_b_value)
+  
+  let pool_output = Output {
+    address: Address { 
+      payment_credential: Credential.Script(script_hash),
+      stake_credential: None,
+    },
+    value: pool_value,
+    datum: InlineDatum(pool_datum),
+    reference_script: None,
+  }
+  
+  let own_input = Input {
+    output_reference: #"",
+    output: pool_output,
+  }
+  
+  // Create pool output with updated settings but same reserves
+  let new_pool_output = Output {
+    address: Address { 
+      payment_credential: Credential.Script(script_hash),
+      stake_credential: None,
+    },
+    value: pool_value,  // Same value
+    datum: InlineDatum(new_pool_datum),
+    reference_script: None,
+  }
+  
+  // Create transaction with owner signature
+  let transaction = Transaction {
+    inputs: [own_input],
+    reference_inputs: [],
+    outputs: [new_pool_output],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 0),
+    extra_signatories: [owner],  // Owner must sign to update settings
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  let ctx = ScriptContext {
+    purpose: aiken/transaction/spend.Spend(#""),
+    transaction,
+  }
+  
+  // Mock the ctx.get_spending_validator_hash() function
+  when ctx.get_spending_validator_hash() is {
+    Some(hash) -> {
+      // Test updating settings
+      let action = DexSwap.PoolAction.UpdateSettings { 
+        new_fee_bps, 
+        new_oracle,
+      }
+      DexSwap.swap_pool(pool_datum, action, ctx)
+    }
+    None -> False,
+  }
+}
+
+// Test oracle reference validation
+test oracle_reference_validation() {
+  // Create a mock oracle reference input
+  let oracle_script = Script { bytes: oracle_hash }
+  
+  let oracle_output = Output {
+    address: Address { 
+      payment_credential: Credential.Script(oracle_hash),
+      stake_credential: None,
+    },
+    value: value.zero(),
+    datum: None,
+    reference_script: Some(oracle_script),
+  }
+  
+  let oracle_input = Input {
+    output_reference: #"oracle_reference",
+    output: oracle_output,
+  }
+  
+  // Create transaction with reference input
+  let transaction = Transaction {
+    inputs: [],
+    reference_inputs: [oracle_input],
+    outputs: [],
+    fee: value.zero(),
+    mint: value.zero(),
+    certificates: [],
+    withdrawals: [],
+    validity_range: (0, 0),
+    extra_signatories: [],
+    redeemers: [],
+    datums: [],
+    id: #"",
+  }
+  
+  // Check oracle reference validation
+  DexSwap.check_oracle_reference(oracle_hash, transaction)
+}

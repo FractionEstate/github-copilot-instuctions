@@ -1,0 +1,219 @@
+// Multi-Signature Wallet Implementation
+// Demonstrates access control and signature verification patterns
+module MultiSig
+
+use aiken/transaction.{ScriptContext, Input, Output}
+use aiken/transaction/credential.{Address, Credential, Script}
+use aiken/transaction/value.{Value, lovelace_of}
+use aiken/list
+use aiken/hash.{Blake2b_224, Hash}
+
+// Type alias for script hash
+type ScriptHash = Hash<Blake2b_224, Script>
+
+// The datum defines access control settings
+type MultiSigDatum {
+  // List of authorized signatories
+  signatories: List<ByteArray>,
+  // Number of signatures required (M-of-N)
+  required_sigs: Int,
+  // Optional time lock for additional security
+  time_lock: Option<Int>,
+}
+
+// Different types of actions that can be performed
+type MultiSigAction {
+  // Basic spending action
+  Spend { purpose: SpendPurpose }
+  // Update wallet configuration
+  UpdateConfig { new_required_sigs: Int }
+  // Add a new signatory
+  AddSignatory { new_signatory: ByteArray }
+  // Remove an existing signatory
+  RemoveSignatory { old_signatory: ByteArray }
+}
+
+// Categories of spending to enforce additional rules
+type SpendPurpose {
+  // Normal withdrawals
+  StandardWithdraw
+  // Emergency withdrawals can bypass time lock
+  EmergencyWithdraw
+  // Protocol upgrades (e.g., migrating to a new validator)
+  ProtocolUpgrade { target_script: ScriptHash }
+}
+
+// Primary validator function
+validator {
+  fn multi_sig(datum: MultiSigDatum, action: MultiSigAction, ctx: ScriptContext) -> Bool {
+    let ScriptContext { transaction, purpose } = ctx
+    
+    // Count how many required signatories have signed this transaction
+    let sig_count =
+      list.filter(
+        datum.signatories,
+        fn(sig) { transaction.is_signed_by(sig) },
+      )
+      |> list.length()
+    
+    // Basic signature check - must meet required threshold
+    let has_enough_sigs = sig_count >= datum.required_sigs
+    
+    // If we don't have enough signatures, fail immediately
+    if !has_enough_sigs {
+      False
+    } else {
+      // Process based on action type
+      when action is {
+        Spend { purpose } -> {
+          when purpose is {
+            StandardWithdraw -> {
+              // Standard withdrawals must respect the time lock
+              when datum.time_lock is {
+                Some(lock_time) -> {
+                  let valid_range = transaction.validity_range
+                  // Ensure transaction is only valid after the time lock
+                  valid_range.1 >= lock_time
+                }
+                None -> {
+                  // No time lock, just check signatures (already done)
+                  True
+                }
+              }
+            }
+            
+            EmergencyWithdraw -> {
+              // Emergency withdrawals require ALL signatories
+              sig_count == list.length(datum.signatories)
+            }
+            
+            ProtocolUpgrade { target_script } -> {
+              // For protocol upgrades, verify that funds are going to the new script
+              transaction.outputs
+              |> list.any(fn(output) {
+                when output.address.payment_credential is {
+                  Credential.Script(script_hash) -> script_hash == target_script,
+                  _ -> False,
+                }
+              })
+            }
+          }
+        }
+        
+        UpdateConfig { new_required_sigs } -> {
+          // Can't set required signatures higher than number of signatories
+          if new_required_sigs > list.length(datum.signatories) {
+            False
+          } else {
+            // Ensure the updated config is stored in an output
+            let this_script_hash = ctx.get_spending_validator_hash()?
+            
+            transaction.outputs
+            |> list.any(fn(output) {
+              // Check if output goes back to this script
+              when output.address.payment_credential is {
+                Credential.Script(script_hash) ->
+                  if script_hash == this_script_hash {
+                    // Check if datum contains the updated config
+                    when output.datum is {
+                      Some(datum_value) -> {
+                        let new_datum: MultiSigDatum = datum_value
+                        new_datum.required_sigs == new_required_sigs
+                      }
+                      None -> False,
+                    }
+                  } else {
+                    False
+                  }
+                _ -> False,
+              }
+            })
+          }
+        }
+        
+        AddSignatory { new_signatory } -> {
+          // Check if signatory already exists (prevent duplicates)
+          if list.has(datum.signatories, new_signatory) {
+            False
+          } else {
+            // Ensure the updated signatory list is stored in an output
+            let this_script_hash = ctx.get_spending_validator_hash()?
+            
+            transaction.outputs
+            |> list.any(fn(output) {
+              when output.address.payment_credential is {
+                Credential.Script(script_hash) ->
+                  if script_hash == this_script_hash {
+                    when output.datum is {
+                      Some(datum_value) -> {
+                        let new_datum: MultiSigDatum = datum_value
+                        let expected_signatories = list.concat(datum.signatories, [new_signatory])
+                        list.all(expected_signatories, fn(sig) {
+                          list.has(new_datum.signatories, sig)
+                        })
+                      }
+                      None -> False,
+                    }
+                  } else {
+                    False
+                  }
+                _ -> False,
+              }
+            })
+          }
+        }
+        
+        RemoveSignatory { old_signatory } -> {
+          // Check if signatory exists
+          if !list.has(datum.signatories, old_signatory) {
+            False
+          } else {
+            // Can't remove if it would make required_sigs > available signatories
+            let new_sig_count = list.length(datum.signatories) - 1
+            if datum.required_sigs > new_sig_count {
+              False
+            } else {
+              // Ensure the updated signatory list is stored in an output
+              let this_script_hash = ctx.get_spending_validator_hash()?
+              
+              transaction.outputs
+              |> list.any(fn(output) {
+                when output.address.payment_credential is {
+                  Credential.Script(script_hash) ->
+                    if script_hash == this_script_hash {
+                      when output.datum is {
+                        Some(datum_value) -> {
+                          let new_datum: MultiSigDatum = datum_value
+                          let expected_signatories = 
+                            list.filter(datum.signatories, fn(sig) { sig != old_signatory })
+                          
+                          list.length(new_datum.signatories) == new_sig_count
+                        }
+                        None -> False,
+                      }
+                    } else {
+                      False
+                    }
+                  _ -> False,
+                }
+              })
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Helper function to create a new MultiSigDatum
+pub fn new_datum(
+  signatories: List<ByteArray>,
+  required_sigs: Int,
+  time_lock: Option<Int>,
+) -> MultiSigDatum {
+  MultiSigDatum {
+    signatories,
+    required_sigs,
+    time_lock,
+  }
+}
